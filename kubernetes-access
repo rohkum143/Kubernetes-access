@@ -1,0 +1,293 @@
+################## Cert Key #########
+openssl genrsa -out john.key 4096
+############# Configuration file for CSR ############
+csr.cnf
+
+[ req ]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+[ dn ]
+CN = john
+O = acom
+[ v3_ext ]
+authorityKeyIdentifier=keyid,issuer:always
+basicConstraints=CA:FALSE
+keyUsage=keyEncipherment,dataEncipherment
+extendedKeyUsage=serverAuth,clientAuth
+
+
+###############################
+
+Uses his name in the Common Name (CN) field: this will be used to identify him against the API Server.
+Uses the group name in the Organisation (O) field: this will be used to identify the group against the API Server.
+
+################################
+openssl req -config ./csr.cnf -new -key john.key -nodes -out john.csr
+######################################################################
+csr.yaml
+
+apiVersion: certificates.k8s.io/v1beta1
+kind: CertificateSigningRequest
+metadata:
+  name: mycsr
+spec:
+  groups:
+  - system:authenticated
+  request: ${BASE64_CSR}
+  usages:
+  - digital signature
+  - key encipherment
+  - server auth
+  - client auth
+
+########################################################################
+export BASE64_CSR=$(cat ./john.csr | base64 | tr -d '\n')
+cat csr.yaml | envsubst | kubectl apply -f -
+
+#########################################################################
+kubectl certificate approve mycsr
+
+kubectl get csr
+
+#######################################################################
+kubectl get csr mycsr -o jsonpath='{.status.certificate}' | base64 --decode > john.crt
+###############################################
+openssl x509 -in ./john.crt -noout -text
+
+######################
+kubectl create ns acomelopment
+#################
+role.yaml
+
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+ namespace: acomelopment
+ name: acom
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services"]
+  verbs: ["create", "get", "update", "list", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["create", "get", "update", "list", "delete"]
+
+kubectl apply -f role.yaml
+
+RoleBinding-User.yaml
+
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+ name: acom
+ namespace: acomelopment
+subjects:
+- kind: User
+  name: john
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+ kind: Role
+ name: acom
+ apiGroup: rbac.authorization.k8s.io
+
+ #############################
+ RoleBinding-group
+
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+ name: acom
+ namespace: acomelopment
+subjects:
+- kind: Group
+  name: acom
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+ kind: Role
+ name: acom
+ apiGroup: rbac.authorization.k8s.io
+
+########################################
+kubectl apply -f role-binding.yaml
+
+#####################################
+
+Building a Kube Config for john
+
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: ${CLUSTER_CA}
+    server: ${CLUSTER_ENDPOINT}
+  name: ${CLUSTER_NAME}
+users:
+- name: ${USER}
+  user:
+    client-certificate-data: ${CLIENT_CERTIFICATE_DATA}
+contexts:
+- context:
+    cluster: ${CLUSTER_NAME}
+    user: john
+  name: ${USER}-${CLUSTER_NAME}
+current-context: ${USER}-${CLUSTER_NAME}
+
+####################
+
+# User identifier
+export USER="john"
+# Cluster Name (get it from the current context)
+export CLUSTER_NAME=$(kubectl config view --minify -o jsonpath={.current-context})
+# Client certificate
+export CLIENT_CERTIFICATE_DATA=$(kubectl get csr mycsr -o jsonpath='{.status.certificate}')
+# Cluster Certificate Authority
+export CLUSTER_CA=$(kubectl config view --raw -o json | jq -r '.clusters[] | select(.name == "'$(kubectl config current-context)'") | .cluster."certificate-authority-data"')
+# API Server endpoint
+export CLUSTER_ENDPOINT=$(kubectl config view --raw -o json | jq -r '.clusters[] | select(.name == "'$(kubectl config current-context)'") | .cluster."server"')
+
+cat kubeconfig.tpl | envsubst > kubeconfig
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##############  Service account #########################
+
+export SA="john"
+export namespace="development"
+export clusteName="k8s-cluster"
+
+kubectl get pod -n ${namespace} --as system:serviceaccount:${namespace}:john
+
+1) namespace creation 
+kubectl create namespace ${namespace} || echo "Already created"
+
+2) Service User creation
+
+sa.yaml
+
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${SA}
+  namespace: ${namespace}
+
+cat sa.yaml | envsubst | kubectl apply -f -
+
+3) Role
+
+access.yaml
+
+
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: ${SA}
+  namespace: ${namespace}
+rules:
+- apiGroups: [""]
+  resources: ["pods", "services"]
+  verbs: ["create", "get", "update", "list", "delete"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["create", "get", "update", "list", "delete"]
+
+
+
+
+cat access.yaml | envsubst | kubectl apply -f -
+
+4) RoleBinding
+
+rolebinding.yaml
+
+
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1beta1
+metadata:
+  name: ${SA}
+  namespace: ${namespace}
+subjects:
+- kind: ServiceAccount
+  name: ${SA}
+  namespace: ${namespace}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ${SA}
+
+
+
+
+
+
+
+cat  rolebinding.yaml | envsubst | kubectl apply -f -
+
+
+kubectl get pod -n development --as system:serviceaccount:development:john
+
+
+
+
+kubectl describe sa ${SA} -n ${namespace}
+
+export Secret=$(kubectl get sa -n ${namespace} ${SA} -o jsonpath={.secrets[].name})
+export token=$(kubectl get secret ${Secret} -n ${namespace} -o "jsonpath={.data.token}" | base64 --decode)
+#CLIENT_CERTIFICATE_DATA kubectl get secret mynamespace-user-token-xxxxx -n mynamespace -o "jsonpath={.data['ca\.crt']}"
+export CLUSTER_ENDPOINT=$(kubectl config view --raw -o json | jq -r '.clusters[] | select(.name == "'$(kubectl config current-context)'") | .cluster."server"')
+###############################
+
+
+Building a Kube Config for SA john
+
+
+kubectl config --kubeconfig="config-admin.txt"  set-cluster ${clusteName} --server=${CLUSTER_ENDPOINT} --insecure-skip-tls-verify
+kubectl config --kubeconfig="config-admin.txt"  set-context ${clusteName} --cluster=${clusteName} --namespace=${namespace} --user=${SA}
+kubectl config --kubeconfig="config-admin.txt"  set-credentials ${SA} --token=${token}
+kubectl config --kubeconfig="config-admin.txt"  use-context ${clusteName}
+
+
+
+
+
+Building a Kube Config for john
+
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    certificate-authority-data: ${CLUSTER_CA}
+    server: ${CLUSTER_ENDPOINT}
+  name: ${CLUSTER_NAME}
+users:
+- name: ${USER}
+  user:
+    client-certificate-data: ${CLIENT_CERTIFICATE_DATA}
+    token: ${TOKEN}
+contexts:
+- context:
+    cluster: ${CLUSTER_NAME}
+    namespace: development
+    user: john
+  name: ${USER}-${CLUSTER_NAME}
+current-context: ${USER}-${CLUSTER_NAME}
+
+
+
